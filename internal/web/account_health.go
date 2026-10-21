@@ -311,6 +311,59 @@ func envIntTransient() int {
 	return v
 }
 
+// cooldownMaxSteps bounds the compounded backoff so a pathological streak can
+// neither overflow the shift nor push an account past its category cap.
+const cooldownMaxSteps = 8
+
+// transportCooldownMax caps how long one shared-transport fault may sideline an
+// account. It is deliberately short: a proxy or DNS blip must not take every
+// account off the pool for minutes, but a fault that keeps repeating still has
+// to keep hurting. Override with M365_TRANSPORT_COOLDOWN_MAX_SECONDS.
+func transportCooldownMax() time.Duration {
+	n := 0
+	if s := strings.TrimSpace(os.Getenv("M365_TRANSPORT_COOLDOWN_MAX_SECONDS")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			n = v
+		}
+	}
+	if n == 0 {
+		n = 300
+	}
+	if n < 30 {
+		n = 30
+	}
+	if n > 3600 {
+		n = 3600
+	}
+	return time.Duration(n) * time.Second
+}
+
+// escalate multiplies base by 2^(attempt-1) and clamps the result to max.
+//
+// Every self-clearing category needs this. A fixed window that restarts at the
+// base value after the cooldown lapses turns a persistent fault into an endless
+// retry loop: the account looks recovered the instant its old window expires,
+// is picked again at once, fails again, and the cycle repeats at a fixed rate
+// forever. attempt is the consecutive-failure streak, which outlives the window.
+func escalate(base time.Duration, attempt int, max time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > cooldownMaxSteps {
+		attempt = cooldownMaxSteps
+	}
+	d := base * time.Duration(1<<(attempt-1))
+	if d <= 0 || d > max {
+		d = max
+	}
+	return d
+}
+
+// CooldownForCategory returns how long an account stays out of rotation for a
+// classified failure. attempt is that account's consecutive-failure streak.
 func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Duration {
 	switch cat {
 	case CategoryQuota429:
@@ -321,20 +374,16 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 			}
 			return d
 		}
-		if attempt < 1 {
-			attempt = 1
-		}
-		if attempt > 7 {
-			attempt = 7
-		}
-		base := transientThrottledCooldown()
-		d := base * time.Duration(1<<(attempt-1))
-		if d > 30*time.Minute || d <= 0 {
-			d = 30 * time.Minute
-		}
-		return d
+		return escalate(transientThrottledCooldown(), attempt, 30*time.Minute)
 	case CategoryOverload503:
-		return 15 * time.Second
+		if retryAfter > 0 {
+			d := time.Duration(retryAfter) * time.Second
+			if d > 2*time.Minute {
+				d = 2 * time.Minute
+			}
+			return d
+		}
+		return escalate(15*time.Second, attempt, 2*time.Minute)
 	case CategoryAuthExpired401:
 		return 2 * time.Minute
 	case CategoryForbidden403:
@@ -349,18 +398,12 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 		return 0
 	case CategoryRetryable422:
 		return 5 * time.Second
-	case CategorySOCKS5:
-		return 30 * time.Second
-	case CategoryDNS:
-		return 30 * time.Second
-	case CategoryTCP:
-		return 15 * time.Second
-	case CategoryTLS:
-		return 30 * time.Second
-	case CategoryWSHandshake:
-		return 15 * time.Second
+	case CategorySOCKS5, CategoryDNS, CategoryTLS:
+		return escalate(30*time.Second, attempt, transportCooldownMax())
+	case CategoryTCP, CategoryWSHandshake:
+		return escalate(15*time.Second, attempt, transportCooldownMax())
 	case CategoryWSReadTimeout, CategoryWSWriteTimeout:
-		return 30 * time.Second
+		return escalate(30*time.Second, attempt, 15*time.Minute)
 	case CategoryUpstreamStructured:
 		return 10 * time.Second
 	case CategoryClientCanceled:
@@ -368,15 +411,29 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 	case CategoryGlobalUnavailable:
 		return 15 * time.Second
 	default:
-		return 15 * time.Second
+		return escalate(15*time.Second, attempt, 5*time.Minute)
 	}
 }
+
+// The global circuit exists to stop hammering a shared fault. When the proxy,
+// DNS, or TLS path to the upstream is broken, every account fails identically,
+// and cooling them one by one only replaces a clear answer with "all accounts
+// are cooling down". The circuit trips on a burst of shared-transport failures
+// with no success in between, and stays open progressively longer on each
+// consecutive trip.
+const (
+	globalCircuitWindow   = 30 * time.Second
+	globalCircuitMinFails = 12
+	globalCircuitBaseOpen = 20 * time.Second
+	globalCircuitMaxOpen  = 2 * time.Minute
+)
 
 type globalCircuitState struct {
 	mu          sync.Mutex
 	windowStart time.Time
 	total       int
 	failures    int
+	trips       int
 	openUntil   time.Time
 }
 
@@ -401,6 +458,12 @@ func (g *globalCircuitState) OpenUntil() time.Time {
 	return g.openUntil
 }
 
+func (g *globalCircuitState) Trips() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.trips
+}
+
 func (g *globalCircuitState) State() string {
 	if g.IsOpen() {
 		return "open"
@@ -408,67 +471,61 @@ func (g *globalCircuitState) State() string {
 	return "closed"
 }
 
+// Record accounts one upstream outcome. A success proves the shared path works
+// again, so it closes the circuit and clears the streak outright; it must never
+// extend or re-arm the open window. (A success arriving after a failure burst
+// used to satisfy the failure ratio and reopen the circuit, so a recovered
+// upstream was kept blocked for another full window.)
 func (g *globalCircuitState) Record(err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
 	if err == nil {
-		g.mu.Lock()
-		now := time.Now()
-		if g.windowStart.IsZero() || now.Sub(g.windowStart) > 30*time.Second {
-			g.windowStart = now
-			g.total = 0
-			g.failures = 0
-		}
-		g.total++
-		if g.total > 1000 {
-			g.windowStart = now
-			g.total = 1
-			g.failures = 0
-		}
-		if g.total >= 10 && g.failures*2 >= g.total {
-			g.openUntil = now.Add(30 * time.Second)
-		}
-		g.mu.Unlock()
+		g.windowStart = time.Time{}
+		g.total = 0
+		g.failures = 0
+		g.trips = 0
+		g.openUntil = time.Time{}
 		return
 	}
-	cat := ClassifyError(err)
-	switch cat {
+	switch ClassifyError(err) {
 	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout, CategoryWSWriteTimeout:
 	default:
-		if cat == CategoryClientCanceled || cat == CategoryGlobalUnavailable {
-			return
-		}
-		// Only shared transport / infrastructure failures contribute to the global circuit.
-		// Quota, overload, auth, and request-specific errors are per-account.
+		// Quota, overload, auth and request-specific errors are per-account: they
+		// say nothing about whether the shared transport still works.
 		return
 	}
-	g.mu.Lock()
-	now := time.Now()
-	if g.windowStart.IsZero() || now.Sub(g.windowStart) > 30*time.Second {
+	if g.windowStart.IsZero() || now.Sub(g.windowStart) > globalCircuitWindow {
 		g.windowStart = now
 		g.total = 0
 		g.failures = 0
 	}
 	g.total++
 	g.failures++
-	if g.total >= 10 && g.failures*2 >= g.total {
-		g.openUntil = now.Add(30 * time.Second)
+	if g.failures < globalCircuitMinFails {
+		return
 	}
-	if g.total > 1000 {
-		g.windowStart = now
-		g.total = 1
-		g.failures = 1
-	}
-	g.mu.Unlock()
+	g.trips++
+	d := escalate(globalCircuitBaseOpen, g.trips, globalCircuitMaxOpen)
+	g.openUntil = now.Add(d)
+	// Start a fresh window: in-flight failures from the same burst must not trip
+	// the circuit again the instant it closes.
+	g.windowStart = now
+	g.total = 0
+	g.failures = 0
 }
 
 func GlobalCircuitIsOpen() bool         { return globalCircuit.IsOpen() }
 func GlobalCircuitState() string        { return globalCircuit.State() }
 func GlobalCircuitOpenUntil() time.Time { return globalCircuit.OpenUntil() }
 func GlobalCircuitRecord(err error)     { globalCircuit.Record(err) }
+func GlobalCircuitTrips() int           { return globalCircuit.Trips() }
 func ResetGlobalCircuit() {
 	globalCircuit.mu.Lock()
 	globalCircuit.windowStart = time.Time{}
 	globalCircuit.total = 0
 	globalCircuit.failures = 0
+	globalCircuit.trips = 0
 	globalCircuit.openUntil = time.Time{}
 	globalCircuit.mu.Unlock()
 }
@@ -487,6 +544,8 @@ type accountHealth struct {
 	lastThrottling         map[string]any
 	authFailReason         map[string]string
 	quotaAttempts          map[string]int
+	failStreak             map[string]int
+	failStreakAt           map[string]time.Time
 	lastCategory           ErrorCategory
 	lastCategoryAt         time.Time
 }
@@ -505,7 +564,39 @@ func newAccountHealth() *accountHealth {
 		lastThrottling:         map[string]any{},
 		authFailReason:         map[string]string{},
 		quotaAttempts:          map[string]int{},
+		failStreak:             map[string]int{},
+		failStreakAt:           map[string]time.Time{},
 	}
+}
+
+// failStreakQuiet ends an escalation episode. Without it a single failure an
+// hour ago would keep inflating the next cooldown, so after this much quiet the
+// streak is dropped and the account is back to the base window.
+const failStreakQuiet = time.Hour
+
+// bumpFailStreakLocked records one more consecutive failure for the account and
+// returns the streak used to escalate its cooldown.
+//
+// The streak deliberately outlives the cooldown window. Clearing it when the
+// window lapsed is what made cooldowns never grow: the account was reinstated
+// at the base value, failed again, and got the same short window forever.
+func (h *accountHealth) bumpFailStreakLocked(accountID string, now time.Time) int {
+	if last, ok := h.failStreakAt[accountID]; ok && now.Sub(last) > failStreakQuiet {
+		delete(h.failStreak, accountID)
+	}
+	h.failStreak[accountID] = h.failStreak[accountID] + 1
+	h.failStreakAt[accountID] = now
+	return h.failStreak[accountID]
+}
+
+// FailStreak reports the account's consecutive-failure streak.
+func (h *accountHealth) FailStreak(accountID string) int {
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failStreak[accountID]
 }
 
 // LastCategory reports the most recent failure category recorded by
@@ -547,6 +638,13 @@ func (h *accountHealth) cleanupExpiredCooldownLocked(accountID string) {
 		delete(h.calls, accountID)
 	}
 	delete(h.quotaAttempts, accountID)
+	// The failure streak is intentionally NOT cleared here: it is what makes the
+	// next cooldown longer than this one. Only a success (MarkSuccess) or a long
+	// quiet period ends the escalation, so prune it once the episode is over.
+	if last, ok := h.failStreakAt[accountID]; ok && time.Now().Sub(last) > failStreakQuiet {
+		delete(h.failStreak, accountID)
+		delete(h.failStreakAt, accountID)
+	}
 	if t, ok := h.imageGenCooldownUntil[accountID]; ok && time.Now().After(t) {
 		delete(h.imageGenCooldownUntil, accountID)
 	}
@@ -710,26 +808,29 @@ func (h *accountHealth) recordFailure(accountID string, err error, window time.D
 	if cat == CategoryClientCanceled {
 		return
 	}
+	now := time.Now()
 	h.mu.Lock()
 	h.lastCategory = cat
-	h.lastCategoryAt = time.Now()
+	h.lastCategoryAt = now
+	step := h.bumpFailStreakLocked(accountID, now)
 	h.mu.Unlock()
 	if cat == CategoryGlobalUnavailable {
 		h.mu.Lock()
-		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, step))
 		h.mu.Unlock()
 		return
 	}
 	// 429 keeps the upstream-advised window: RetryAfter wins when present,
-	// otherwise the backoff grows with consecutive attempts. MarkSuccess clears
-	// quotaAttempts, so a recovered account returns to the short base window.
+	// otherwise the backoff grows with the consecutive-failure streak.
+	// quotaAttempts is still tracked for reporting, but the escalation state that
+	// must survive a lapsed window lives in failStreak.
 	if cat == CategoryQuota429 {
 		h.mu.Lock()
 		h.quotaAttempts[accountID] = h.quotaAttempts[accountID] + 1
 		h.limited[accountID] = true
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
-		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), h.quotaAttempts[accountID]))
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), step))
 		h.mu.Unlock()
 		return
 	}
@@ -782,13 +883,13 @@ func (h *accountHealth) recordFailure(accountID string, err error, window time.D
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
 		delete(h.limited, accountID)
-		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), 1))
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, RetryAfterSeconds(err), step))
 		return
 	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout, CategoryWSWriteTimeout:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
 		delete(h.limited, accountID)
-		cd := CooldownForCategory(cat, 0, 1)
+		cd := CooldownForCategory(cat, 0, step)
 		h.cooldown[accountID] = time.Now().Add(cd)
 		return
 	case CategoryUpstreamStructured:
@@ -823,7 +924,7 @@ func (h *accountHealth) recordFailure(accountID string, err error, window time.D
 		if cd > 30*time.Second {
 			cd = 30 * time.Second
 		}
-		h.cooldown[accountID] = time.Now().Add(cd)
+		h.cooldown[accountID] = time.Now().Add(escalate(cd, step, 5*time.Minute))
 	}
 }
 
@@ -839,6 +940,10 @@ func (h *accountHealth) MarkSuccess(accountID string) {
 	delete(h.limited, accountID)
 	delete(h.authFailReason, accountID)
 	delete(h.quotaAttempts, accountID)
+	// A success is the only proof that the account recovered, so it ends the
+	// escalation instead of letting a stale streak inflate the next window.
+	delete(h.failStreak, accountID)
+	delete(h.failStreakAt, accountID)
 	GlobalCircuitRecord(nil)
 	if imageLimited && time.Now().Before(imageLimitUntil) {
 		h.imageLimited[accountID] = true
@@ -1006,10 +1111,6 @@ func (h *accountHealth) ClearAllCooldowns() {
 
 func (h *accountHealth) EarliestRecovery() time.Time {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.cooldown) == 0 {
-		return time.Time{}
-	}
 	var earliest time.Time
 	first := true
 	for _, until := range h.cooldown {
@@ -1018,6 +1119,10 @@ func (h *accountHealth) EarliestRecovery() time.Time {
 			first = false
 		}
 	}
+	h.mu.Unlock()
+	// An open circuit gates every account even when no per-account cooldown is
+	// left, so it has to be part of the answer; otherwise callers conclude that
+	// nothing is cooling, skip the wait, and retry straight into the open gate.
 	if GlobalCircuitIsOpen() {
 		if gu := GlobalCircuitOpenUntil(); !gu.IsZero() && (earliest.IsZero() || gu.Before(earliest)) {
 			earliest = gu

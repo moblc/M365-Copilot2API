@@ -1541,6 +1541,24 @@ func (s *Server) resolveAccountUntil(ctx context.Context, accountID string, dead
 		if tok, ok := s.tryResolve(ctx); ok {
 			return tok, nil
 		}
+		// A tripped global circuit means the shared transport (proxy, DNS, TLS,
+		// websocket handshake) is failing for every account, not that each
+		// account earned its own cooldown. Waiting would only burn the request
+		// timeout on requests that are certain to fail, so answer immediately
+		// with the real reason and a Retry-After the client can honour.
+		if GlobalCircuitIsOpen() {
+			retry := int(time.Until(GlobalCircuitOpenUntil()).Seconds())
+			if retry < 1 {
+				retry = 1
+			}
+			cat, _ := s.accountPool.LastCategory()
+			return auth.AccountToken{}, &UpstreamHTTPError{
+				Status:     503,
+				ErrorCode:  "transport_error",
+				RetryAfter: retry,
+				Body:       fmt.Sprintf("upstream transport is unavailable for every account (%s); shared connection circuit open, retry in %ds", cat, retry),
+			}
+		}
 		// No account could be validated. Under burst load every account can be
 		// cooling at the same instant, so a single fixed wait makes all the
 		// queued requests retry in lockstep and collide again. Back off with
@@ -1582,6 +1600,12 @@ func (s *Server) resolveAccountUntil(ctx context.Context, accountID string, dead
 		if retry < 5 {
 			retry = 5
 		}
+		// A banned or disabled account can carry a cooldown measured in days, and
+		// echoing that as Retry-After tells the client to come back next year.
+		// The gateway will have re-evaluated long before that, so cap the hint.
+		if retry > 600 {
+			retry = 600
+		}
 		// Name the reason we actually observed. Only when a real transport
 		// fault is the latest signal do we call it a transport problem; a
 		// quota cooldown is reported as rate limiting rather than disguised as
@@ -1590,7 +1614,7 @@ func (s *Server) resolveAccountUntil(ctx context.Context, accountID string, dead
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are rate limited by upstream; retry after cooldown"}
 		}
 		if cat, at := s.accountPool.LastCategory(); time.Since(at) < 5*time.Minute && IsTransportCategory(cat) {
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 503, ErrorCode: "transport_error", RetryAfter: retry, Body: "all accounts cooling down after transport errors (last: " + string(cat) + ")"}
+			return auth.AccountToken{}, &UpstreamHTTPError{Status: 503, ErrorCode: "transport_error", RetryAfter: retry, Body: fmt.Sprintf("all accounts cooling down after transport errors (last: %s, each account backs off further while it keeps failing); retry in %ds", cat, retry)}
 		}
 		return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 	}
@@ -1675,27 +1699,59 @@ func (s *Server) failoverStats(attempted []string) (total, throttled, healthy, a
 }
 
 func (s *Server) writeFailoverExhausted(w http.ResponseWriter, attempted []string) {
+	status, retry, payload := s.failoverExhaustedDetails(attempted)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", fmt.Sprint(retry))
+	w.Header().Set("X-M365-Retry-After", fmt.Sprint(retry))
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// failoverExhaustedPayload is the same diagnostic without the transport status,
+// for streaming paths that can no longer change the response status.
+func (s *Server) failoverExhaustedPayload(attempted []string) map[string]any {
+	_, _, payload := s.failoverExhaustedDetails(attempted)
+	return payload
+}
+
+// failoverExhaustedDetails explains why failover gave up.
+//
+// It used to always answer 429 rate_limit_exhausted, even when the accounts were
+// sidelined by a shared transport fault. Clients back off on 429 as if quota ran
+// out, so a broken proxy or websocket handshake was reported as "rate limited"
+// and retried at the wrong cadence. Name the transport when that is what we saw;
+// keep 429 only for a genuine quota exhaustion.
+func (s *Server) failoverExhaustedDetails(attempted []string) (status int, retry int, payload map[string]any) {
 	total, throttled, healthy, attemptedCount := s.failoverStats(attempted)
-	retry := 30
+	retry = 30
+	cat := CategoryUnknown
 	if s.accountPool != nil {
 		if until := s.accountPool.EarliestRecovery(); !until.IsZero() {
 			if r := int(time.Until(until).Seconds()); r > 0 {
 				retry = r
 			}
 		}
+		cat, _ = s.accountPool.LastCategory()
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", fmt.Sprint(retry))
-	w.Header().Set("X-M365-Retry-After", fmt.Sprint(retry))
-	w.WriteHeader(http.StatusTooManyRequests)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":              map[string]any{"message": "所有账号均触发限流，请稍后重试", "type": "rate_limit_error", "code": "rate_limit_exhausted"},
+	message := "所有账号均触发限流，请稍后重试"
+	errorType := "rate_limit_error"
+	errorCode := "rate_limit_exhausted"
+	status = http.StatusTooManyRequests
+	if GlobalCircuitIsOpen() || IsTransportCategory(cat) {
+		status = http.StatusServiceUnavailable
+		errorType = "transport_error"
+		errorCode = "upstream_unavailable"
+		message = "所有账号均因上游连接故障暂停使用（" + string(cat) + "），请稍后重试"
+	}
+	payload = map[string]any{
+		"error":              map[string]any{"message": message, "type": errorType, "code": errorCode},
 		"total_accounts":     total,
 		"throttled_accounts": throttled,
 		"healthy_accounts":   healthy,
 		"attempted_accounts": attemptedCount,
 		"failover_status":    "exhausted",
-	})
+	}
+	return status, retry, payload
 }
 
 func (s *Server) nextHealthyExcluding(tried map[string]bool) (auth.AccountToken, bool) {
@@ -1915,7 +1971,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		if body.AccountID == "" && body.ConversationID == "" && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
-			s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 			succeeded := false
 			var lastErr error = originalErr
 			for {
@@ -1950,11 +2005,9 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if isThrottledForFailover(err2) {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					lastErr = err2
 					continue
 				}
-				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(next.ID)
 				}
@@ -1973,7 +2026,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					s.writeFailoverExhausted(w, attempted)
 					return
 				}
-				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
@@ -1999,7 +2051,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					FeatureFlags:          s.featureFlags(),
 				})
 				if err2 == nil {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
@@ -2008,7 +2059,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					res = res2
 					err = nil
 				} else {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -2016,7 +2066,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if err != nil {
-				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
@@ -2024,7 +2073,6 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -2771,7 +2819,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			origErr := err
 			_ = origErr
 			succeeded := false
@@ -2822,11 +2869,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if isThrottledForFailover(err2) {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					err = err2
 					continue
 				}
-				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(next.ID)
 				}
@@ -2837,8 +2882,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if !succeeded && isThrottledForFailover(err) && len(attempted) > 1 {
 				// check if no healthy left
 				if _, ok := s.nextHealthyExcluding(tried); !ok {
-					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
-					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "所有账号均触发限流，请稍后重试", "type": "rate_limit_error", "code": "rate_limit_exhausted"}, "total_accounts": len(s.tokens.List()), "throttled_accounts": func() int { _, t, _, _ := s.failoverStats(attempted); return t }(), "healthy_accounts": func() int { _, _, h, _ := s.failoverStats(attempted); return h }(), "attempted_accounts": len(attempted), "failover_status": "exhausted"})+"\n\n")
+					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(s.failoverExhaustedPayload(attempted))+"\n\n")
 					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 					return
 				}
@@ -2878,7 +2922,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					return nil
 				})
 				if err2 == nil {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
@@ -2887,11 +2930,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					acc = next
 					err = nil
 				} else {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -2901,7 +2942,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -3112,7 +3152,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil && !sw2.isCommitted() && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			for {
 				next, ok := s.nextHealthyExcluding(tried)
 				if !ok {
@@ -3136,12 +3175,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if isThrottledForFailover(err2) {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					err = err2
 					acc = next
 					continue
 				}
-				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(next.ID)
 				}
@@ -3151,7 +3188,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if err != nil && isThrottledForFailover(err) {
 				if _, ok := s.nextHealthyExcluding(tried); !ok {
-					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "所有账号均触发限流，请稍后重试", "type": "rate_limit_error", "code": "rate_limit_exhausted"}, "total_accounts": len(s.tokens.List()), "throttled_accounts": func() int { _, t, _, _ := s.failoverStats(attempted); return t }(), "healthy_accounts": func() int { _, _, h, _ := s.failoverStats(attempted); return h }(), "attempted_accounts": len(attempted), "failover_status": "exhausted"})+"\n\n")
+					_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(s.failoverExhaustedPayload(attempted))+"\n\n")
 					_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 					return
 				}
@@ -3168,7 +3205,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
 				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
@@ -3177,11 +3213,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					acc = next
 					err = nil
 				} else {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -3228,7 +3262,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -3285,7 +3318,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			for {
 				next, ok := s.nextHealthyExcluding(tried)
 				if !ok {
@@ -3310,12 +3342,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if isThrottledForFailover(err2) {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					err = err2
 					acc = next
 					continue
 				}
-				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(next.ID)
 				}
@@ -3342,7 +3372,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
 				if err2 == nil {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
@@ -3351,11 +3380,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					acc = next
 					err = nil
 				} else {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
 					}
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
 					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(next.ID)
 					}
@@ -3365,7 +3392,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
 		}

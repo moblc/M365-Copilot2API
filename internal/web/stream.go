@@ -74,7 +74,6 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
-		s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 		writeUpstreamError(w, err)
 		return
 	}
