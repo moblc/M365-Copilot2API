@@ -1,9 +1,12 @@
-name: Release
+name: CI and Release
 
 on:
   push:
+    branches:
+      - '**'
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
   workflow_dispatch:
     inputs:
       tag:
@@ -12,7 +15,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CGO_ENABLED: 0
@@ -24,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -45,9 +50,41 @@ jobs:
           path: internal/web/web/webapp/
           if-no-files-found: error
 
+  verify:
+    name: Test and vet
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Download console
+        uses: actions/download-artifact@v4
+        with:
+          name: web-console
+          path: internal/web/web/webapp/
+
+      - name: Check formatting
+        run: gofmt -l .
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
   package:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: frontend
+    needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -107,6 +144,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Setup Go
@@ -124,14 +162,16 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
         run: |
           set -euo pipefail
           mkdir -p dist
           suffix=""
           if [ "${GOOS}" = "windows" ]; then suffix=".exe"; fi
           output="dist/${BINARY_NAME}-${GOOS}-${GOARCH}${suffix}"
-          version="${GITHUB_REF_NAME#v}"
           commit="$(git rev-parse --short HEAD)"
+          version="${RELEASE_TAG#v}"
+          if [ -z "${version}" ]; then version="dev-${commit}"; fi
           build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           ldflags="-s -w -X m365-copilot2api/internal/web.Version=${version} -X m365-copilot2api/internal/web.Commit=${commit} -X m365-copilot2api/internal/web.BuildTime=${build_time}"
           go build -trimpath -ldflags="${ldflags}" -o "${output}" ./cmd/server
@@ -146,11 +186,15 @@ jobs:
   release:
     name: Publish Release
     needs: package
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Download binaries
