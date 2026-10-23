@@ -8,6 +8,33 @@ import (
 	"m365-copilot2api/internal/chathub"
 )
 
+func TestReplayAnswerRequestClearsUpstreamState(t *testing.T) {
+	original := chathub.Request{
+		Text: "incremental message",
+		ConversationID: "account-a-conversation",
+		SessionID: "account-a-session",
+		ConversationSignature: "account-a-signature",
+		PreviousMessages: []chathub.ContextMessage{{Author: "user", Description: "old context"}},
+		Started: true,
+		Tone: "magic",
+		Tools: []chathub.Tool{{Type: "function", Function: json.RawMessage(`{"name":"read_file"}`)}},
+	}
+	fullPrompt := "[user]\noriginal task\n[assistant]\nprevious answer\n[user]\ncontinue"
+	replayed := replayAnswerRequest(original, fullPrompt, nil)
+	if replayed.Text != fullPrompt {
+		t.Fatal("failover lost full conversation history")
+	}
+	if replayed.ConversationID != "" || replayed.SessionID != "" || replayed.ConversationSignature != "" || len(replayed.PreviousMessages) != 0 || replayed.Started {
+		t.Fatalf("failover retained previous account state: %#v", replayed)
+	}
+	if replayed.Tone != original.Tone || len(replayed.Tools) != len(original.Tools) {
+		t.Fatal("failover lost request configuration")
+	}
+	if original.ConversationID != "account-a-conversation" || original.Text != "incremental message" {
+		t.Fatal("replay mutated the original request")
+	}
+}
+
 func answerRequestTestBody() oaiReq {
 	return oaiReq{
 		ConversationID: "conversation-1",

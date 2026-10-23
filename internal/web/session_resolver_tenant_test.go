@@ -80,6 +80,28 @@ func TestExplicitSessionIDIsolatedByTenant(t *testing.T) {
 
 // TestGetDeleteListScopedByTenant covers the /v1/sessions read/delete surface:
 // one tenant can neither read, enumerate, nor delete another tenant's binding.
+func TestExplicitSessionRejectsDivergentHistory(t *testing.T) {
+	sr := newTenantResolver(t)
+	r := tenantReq("key-a", "203.0.113.9", "ua")
+	r.Header.Set("X-M365-Session-Id", "shared-id")
+	history := []oaiMsg{{Role: "user", Content: "original task"}, {Role: "assistant", Content: "original answer"}}
+	sr.Bind("", "conv-original", "acc-a", &oaiReq{Messages: history}, "", r)
+
+	for _, messages := range [][]oaiMsg{
+		{{Role: "user", Content: "unrelated task"}},
+		{{Role: "user", Content: "original task"}, {Role: "assistant", Content: "different answer"}, {Role: "user", Content: "continue"}},
+	} {
+		if got := sr.Resolve(r, &oaiReq{Messages: messages}); !got.IsNew || got.ConversationID != "" {
+			t.Fatalf("divergent history reused upstream conversation: %+v", got)
+		}
+	}
+
+	continued := append(append([]oaiMsg{}, history...), oaiMsg{Role: "user", Content: "continue"})
+	if got := sr.Resolve(r, &oaiReq{Messages: continued}); got.IsNew || got.ConversationID != "conv-original" || got.HistoryLen != len(history) {
+		t.Fatalf("valid continuation lost its conversation: %+v", got)
+	}
+}
+
 func TestGetDeleteListScopedByTenant(t *testing.T) {
 	sr := newTenantResolver(t)
 	tenantA := tenantFromRequest(tenantReq("key-a", "203.0.113.1", "ua"))

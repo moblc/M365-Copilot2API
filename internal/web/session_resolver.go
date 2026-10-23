@@ -301,6 +301,9 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	if explicitID != "" {
 		if sessID, ok := sr.byExplicit[explicitKey(tenant, explicitID)]; ok {
 			if sess, ok := sr.sessions[sessID]; ok && sess.Tenant == tenant {
+				if contextPrefixLen(sess.ContextHistory, body.Messages) == 0 {
+					return ResolveResult{IsNew: true}
+				}
 				sess.LastUsedAt = time.Now().UTC()
 				sr.sessions[sessID] = sess
 				sr.persist.markDirty()
@@ -337,22 +340,6 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 
 	// 寮辩害鏉熷厹搴曪細鍐呭涓嶆瀯鎴愪弗鏍煎墠缂€锛屼絾涓庢煇涓巻鍙查珮搴︾浉浼硷紙濡傚鎴风
 	// 鏈湴鎴柇浜嗗巻鍙诧級锛屼粛澶嶇敤璇ヤ細璇濄€傛鏃跺閲忚竟鐣屾湭鐭ワ紝涓婂眰鍙戦€佸叏閲忋€?
-	suffixID, suffixN := sr.matchSuffixLocked(tenant, ipFinger, body.Messages)
-	if suffixID != "" {
-		sess := sr.sessions[suffixID]
-		sess.LastUsedAt = time.Now().UTC()
-		sr.sessions[suffixID] = sess
-		sr.persist.markDirty()
-		return ResolveResult{
-			SessionID:      sess.SessionID,
-			ConversationID: sess.ConversationID,
-			AccountID:      sess.AccountID,
-			MatchedBy:      fmt.Sprintf("context_suffix_%d", suffixN),
-			IsNew:          false,
-			HistoryLen:     suffixN,
-		}
-	}
-
 	return ResolveResult{IsNew: true}
 }
 

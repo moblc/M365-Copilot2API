@@ -2360,6 +2360,17 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 	return req
 }
 
+func replayAnswerRequest(req chathub.Request, fullPrompt string, attachments []chathub.Attachment) chathub.Request {
+	req.Text = fullPrompt
+	req.Attachments = append([]chathub.Attachment(nil), attachments...)
+	req.ConversationID = ""
+	req.SessionID = ""
+	req.ConversationSignature = ""
+	req.PreviousMessages = nil
+	req.Started = false
+	return req
+}
+
 func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFrom(r)
 	if requestID == "" {
@@ -2587,24 +2598,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// was provided by client, session key, user session, or session resolver.
 	convReused := false
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
-	if body.ConversationID == "" && len(body.Messages) > 1 &&
-		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
-		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
-			if len(body.Messages) > cached.MessageCount {
-				incPrompt, incAtt := flattenPromptMessages(incrementalPromptMessages(body.Messages, cached.MessageCount), nil)
-				incPrompt = strings.TrimSpace(incPrompt)
-				if incPrompt != "" && hasActionableTurn(incPrompt) {
-					body.ConversationID = cached.ConversationID
-					body.SessionID = cached.SessionID
-					answerPrompt = incPrompt
-					body.Attachments = incAtt
-					convReused = true
-					log.Printf("[conv-cache] hit account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
-				}
-			}
-		}
-	}
 	if !convReused && body.ConversationID == "" {
 		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
 	}
@@ -2650,6 +2643,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 	localeInfo := parseLocaleFromHeaders(r)
+	fullAnswerPrompt := buildAnswerRequest(prompt, tone, body, activeLedger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, tempSession).Text
 	// The stream is opened by the actual response path below. Do not emit a
 	// tool preamble here: a request may contain tools in its schema while still
 	// being an ordinary text question.
@@ -2768,7 +2762,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			pending.WriteString(held)
 			return nil
 		})
-		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
+		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && !explicitAccount && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
 			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
@@ -2783,11 +2777,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				tried[next.ID] = true
 				attempted = append(attempted, next.ID)
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
+				failoverReq := replayAnswerRequest(answerReq, fullAnswerPrompt, fullAttachments)
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
 					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
@@ -2843,15 +2833,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-		} else if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
+		} else if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && !explicitAccount && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
+				failoverReq := replayAnswerRequest(answerReq, fullAnswerPrompt, fullAttachments)
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
 				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
@@ -3109,7 +3095,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDelta, onReasoning)
-		if err != nil && !sw2.isCommitted() && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
+		if err != nil && !sw2.isCommitted() && !convReused && !explicitAccount && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
 			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
@@ -3120,11 +3106,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				tried[next.ID] = true
 				attempted = append(attempted, next.ID)
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
+				failoverReq := replayAnswerRequest(answerReq, fullAnswerPrompt, fullAttachments)
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning)
 				cancel2()
@@ -3156,15 +3138,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-		} else if err != nil && !sw2.isCommitted() && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
+		} else if err != nil && !sw2.isCommitted() && !convReused && !explicitAccount && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
+				failoverReq := replayAnswerRequest(answerReq, fullAnswerPrompt, fullAttachments)
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
 				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
@@ -3282,7 +3260,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				err = nil
 			}
 		}
-		if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
+		if err != nil && !convReused && !explicitAccount && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && isThrottledForFailover(err) {
 			tried := map[string]bool{acc.ID: true}
 			attempted := []string{acc.ID}
 			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
@@ -3294,11 +3272,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				tried[next.ID] = true
 				attempted = append(attempted, next.ID)
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
+				failoverReq := replayAnswerRequest(answerReq, fullAnswerPrompt, fullAttachments)
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
 				cancel2()
@@ -3329,15 +3303,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-		} else if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
+		} else if err != nil && !convReused && !explicitAccount && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsAuthFailure(err) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
-				failoverReq := answerReq
-				if body.ConversationID == resolvedConversationID {
-					failoverReq.ConversationID = ""
-					failoverReq.SessionID = ""
-				}
+				failoverReq := replayAnswerRequest(answerReq, fullAnswerPrompt, fullAttachments)
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
