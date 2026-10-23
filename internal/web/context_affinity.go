@@ -29,7 +29,7 @@ type contextBinding struct {
 	Hash           string    `json:"hash"`
 	Messages       []oaiMsg  `json:"messages,omitempty"`
 	ExplicitID     string    `json:"explicitId,omitempty"`
-	Tenantstring`json:"tenant,omitempty"`
+	Tenant         string    `json:"tenant,omitempty"`
 }
 
 type contextAffinity struct {
@@ -56,13 +56,13 @@ func (c *contextAffinity) evictLocked(now time.Time) {
 		if now.Sub(b.LastUsedAt) > c.ttl {
 			delete(c.bindings, k)
 			if b.Hash != "" {
-				if c.byHash[b.Hash] == k {
-					delete(c.byHash, b.Hash)
+				if c.byHash[b.Tenant+":"+b.Hash] == k {
+					delete(c.byHash, b.Tenant+":"+b.Hash)
 				}
 			}
 			if b.ExplicitID != "" {
-				if c.byExplicit[b.ExplicitID] == k {
-					delete(c.byExplicit, b.ExplicitID)
+				if c.byExplicit[b.Tenant+":"+b.ExplicitID] == k {
+					delete(c.byExplicit, b.Tenant+":"+b.ExplicitID)
 				}
 			}
 		}
@@ -80,11 +80,11 @@ func (c *contextAffinity) evictLocked(now time.Time) {
 	for _, k := range ids[:len(c.bindings)-c.max] {
 		b := c.bindings[k]
 		delete(c.bindings, k)
-		if b.Hash != "" && c.byHash[b.Hash] == k {
-			delete(c.byHash, b.Hash)
+		if b.Hash != "" && c.byHash[b.Tenant+":"+b.Hash] == k {
+			delete(c.byHash, b.Tenant+":"+b.Hash)
 		}
-		if b.ExplicitID != "" && c.byExplicit[b.ExplicitID] == k {
-			delete(c.byExplicit, b.ExplicitID)
+		if b.ExplicitID != "" && c.byExplicit[b.Tenant+":"+b.ExplicitID] == k {
+			delete(c.byExplicit, b.Tenant+":"+b.ExplicitID)
 		}
 	}
 }
@@ -170,11 +170,14 @@ func contextHash(messages []oaiMsg) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (c *contextAffinity) lookupPrefixLocked(messages []oaiMsg) (string, int) {
+func (c *contextAffinity) lookupPrefixLocked(tenant string, messages []oaiMsg) (string, int) {
 	bestKey := ""
 	bestN := 0
 	var bestTime time.Time
 	for k, b := range c.bindings {
+		if b.Tenant != tenant {
+			continue
+		}
 		if len(b.Messages) == 0 || len(messages) < len(b.Messages) {
 			continue
 		}
@@ -236,7 +239,7 @@ func (c *contextAffinity) Resolve(s *Server, r *http.Request, body *oaiReq) (str
 		}
 		key := scopedKey
 		if _, exists := c.bindings[key]; exists {
-			key = scopedKey + ":" + contextHash(body.Messages)[:8]
+			key = scopedKey + ":" + contextHash(body.Messages)
 		}
 		b := contextBinding{AccountID: accID, LastUsedAt: time.Now(), Hash: contextHash(body.Messages), Messages: cloneMessages(body.Messages), ExplicitID: explicitID, Tenant: tenant}
 		c.bindings[key] = b
@@ -264,7 +267,7 @@ func (c *contextAffinity) Resolve(s *Server, r *http.Request, body *oaiReq) (str
 			}
 		}
 	}
-	if key, _ := c.lookupPrefixLocked(body.Messages); key != "" {
+	if key, _ := c.lookupPrefixLocked(tenant, body.Messages); key != "" {
 		if b, ok := c.bindings[key]; ok {
 			if b.Tenant == tenant && s.accountUsable(b.AccountID) {
 				newHash := hash
@@ -275,23 +278,23 @@ func (c *contextAffinity) Resolve(s *Server, r *http.Request, body *oaiReq) (str
 				b.LastUsedAt = time.Now()
 				c.bindings[key] = b
 				if oldHash != "" && oldHash != newHash {
-					delete(c.byHash, oldHash)
+					delete(c.byHash, tenant+":"+oldHash)
 				}
-				c.byHash[newHash] = key
+				c.byHash[tenant+":"+newHash] = key
 				return b.AccountID, true
 			}
 		}
 	}
-	accID:=c.pickNextHealthyLocked(s)
-	if accID =="" {
+	accID := c.pickNextHealthyLocked(s)
+	if accID == "" {
 		return "", false
 	}
-	key :=scopedHash
-	if_, exists:= c.bindings[key];exists {
-		key= scopedHash + ":" + hex.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))[:8]
+	key := scopedHash
+	if _, exists := c.bindings[key]; exists {
+		key = scopedHash + ":" + hex.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))[:8]
 	}
-	b:= contextBinding{AccountID:accID, LastUsedAt: time.Now(),Hash: hash, Messages: cloneMessages(body.Messages), Tenant: tenant}
-	c.bindings[key] =b
+	b := contextBinding{AccountID: accID, LastUsedAt: time.Now(), Hash: hash, Messages: cloneMessages(body.Messages), Tenant: tenant}
+	c.bindings[key] = b
 	c.byHash[scopedHash] = key
 	return accID, true
 }
@@ -310,11 +313,11 @@ func (c *contextAffinity) ForgetAccount(accountID string) {
 			continue
 		}
 		delete(c.bindings, k)
-		if b.Hash != "" && c.byHash[b.Hash] == k {
-			delete(c.byHash, b.Hash)
+		if b.Hash != "" && c.byHash[b.Tenant+":"+b.Hash] == k {
+			delete(c.byHash, b.Tenant+":"+b.Hash)
 		}
-		if b.ExplicitID != "" && c.byExplicit[b.ExplicitID] == k {
-			delete(c.byExplicit, b.ExplicitID)
+		if b.ExplicitID != "" && c.byExplicit[b.Tenant+":"+b.ExplicitID] == k {
+			delete(c.byExplicit, b.Tenant+":"+b.ExplicitID)
 		}
 	}
 }
@@ -350,67 +353,67 @@ func (c *contextAffinity) pickNextHealthyLocked(s *Server) string {
 	return firstHealthy
 }
 
-func (c *contextAffinity) BindConversation(accountID, conversationID, sessionID string,body*oaiReq, r *http.Request) {
-	if c== nil ||accountID == "" {
+func (c *contextAffinity) BindConversation(accountID, conversationID, sessionID string, body *oaiReq, r *http.Request) {
+	if c == nil || accountID == "" {
 		return
 	}
 	c.mu.Lock()
-	deferc.mu.Unlock()
-	tenant:= tenantFromRequest(r)
-	hash:= contextHash(body.Messages)
-	explicitID :=strings.TrimSpace(r.Header.Get(sessionHeaderName))
-	scopedKey:= tenant +":" + explicitID
-	scopedHash := tenant+ ":" +hash
-	if explicitID !="" {
-		ifkey, ok := c.byExplicit[scopedKey]; ok {
-			if b, ok := c.bindings[key]; ok{
-				b.AccountID= accountID
+	defer c.mu.Unlock()
+	tenant := tenantFromRequest(r)
+	hash := contextHash(body.Messages)
+	explicitID := strings.TrimSpace(r.Header.Get(sessionHeaderName))
+	scopedKey := tenant + ":" + explicitID
+	scopedHash := tenant + ":" + hash
+	if explicitID != "" {
+		if key, ok := c.byExplicit[scopedKey]; ok {
+			if b, ok := c.bindings[key]; ok {
+				b.AccountID = accountID
 				b.ConversationID = conversationID
-				b.SessionID =sessionID
-				b.LastUsedAt =time.Now()
-				if hash !=""{
-					oldHash :=b.Hash
-					b.Hash= hash
-					b.Messages =cloneMessages(body.Messages)
-					ifoldHash != ""&& oldHash != hash {
+				b.SessionID = sessionID
+				b.LastUsedAt = time.Now()
+				if hash != "" {
+					oldHash := b.Hash
+					b.Hash = hash
+					b.Messages = cloneMessages(body.Messages)
+					if oldHash != "" && oldHash != hash {
 						delete(c.byHash, tenant+":"+oldHash)
 					}
 					c.byHash[scopedHash] = key
 				}
-				c.bindings[key]= b
+				c.bindings[key] = b
 				return
 			}
 		}
 	}
 	if hash != "" {
-		ifkey, ok := c.byHash[scopedHash]; ok{
-			if b, ok := c.bindings[key]; ok{
-				b.AccountID =accountID
-				b.ConversationID= conversationID
-				b.SessionID =sessionID
+		if key, ok := c.byHash[scopedHash]; ok {
+			if b, ok := c.bindings[key]; ok {
+				b.AccountID = accountID
+				b.ConversationID = conversationID
+				b.SessionID = sessionID
 				b.LastUsedAt = time.Now()
-				b.Messages= cloneMessages(body.Messages)
-				c.bindings[key]= b
+				b.Messages = cloneMessages(body.Messages)
+				c.bindings[key] = b
 				return
 			}
 		}
 	}
 	//also check prefixmatchfor continuation
-	if key, _:=c.lookupPrefixLocked(body.Messages); key!="" {
-		if b,ok := c.bindings[key]; ok {
-			ifb.Tenant == tenant {
+	if key, _ := c.lookupPrefixLocked(tenant, body.Messages); key != "" {
+		if b, ok := c.bindings[key]; ok {
+			if b.Tenant == tenant {
 				b.AccountID = accountID
-				b.ConversationID =conversationID
+				b.ConversationID = conversationID
 				b.SessionID = sessionID
-				b.LastUsedAt =time.Now()
-				ifhash != "" {
+				b.LastUsedAt = time.Now()
+				if hash != "" {
 					oldHash := b.Hash
 					b.Hash = hash
 					b.Messages = cloneMessages(body.Messages)
-					if oldHash != ""&& oldHash != hash {
-						delete(c.byHash,tenant+":"+oldHash)
+					if oldHash != "" && oldHash != hash {
+						delete(c.byHash, tenant+":"+oldHash)
 					}
-					c.byHash[scopedHash]= key
+					c.byHash[scopedHash] = key
 				}
 				c.bindings[key] = b
 			}
