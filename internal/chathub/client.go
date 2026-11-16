@@ -321,7 +321,7 @@ type Client struct {
 
 func NewClient() *Client {
 	h := make(http.Header)
-	h.Set("Origin", "https://m365.cloud.microsoft")
+	h.Set("Origin", "https://copilot.cloud.microsoft")
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 	d := outbound.WebSocketDialer()
 	return &Client{
@@ -370,11 +370,13 @@ func (c *Client) ChatWithReasoning(ctx context.Context, acc Account, req Request
 	})
 }
 
-// poolEligibleFor reports whether a request may take from (and return to)
-// the WebSocket connection pool. Only fresh requests without caller-supplied
-// conversation/session IDs qualify: pooled sockets carry random URL-bound IDs.
+// poolEligibleFor reports whether a request may consume a pre-warmed socket
+// from the connection pool. Only fresh requests without caller-supplied
+// conversation/session IDs qualify: a pooled socket is bound to the IDs in its
+// own URL, which the request then adopts. Memory-disabled requests need their
+// own URL flag and always dial.
 func poolEligibleFor(req Request) bool {
-	return req.ConversationID == "" && req.SessionID == ""
+	return req.ConversationID == "" && req.SessionID == "" && !req.DisableMemory
 }
 
 func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
@@ -390,69 +392,52 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		req.Tone = defaultTone
 	}
 	firstTurn := req.Started
-	// A pooled WebSocket was dialed with random conversation/session IDs, so
-	// it is only safe for a fresh request. Continuing an upstream conversation
-	// with mismatched URL-bound IDs completes immediately with no text
-	// (community PR #62/#86 finding). Fresh requests reuse; continuations dial.
-	// poolEligible also gates Return: only a fresh, healthy, completed request
-	// hands its connection back to the pool.
+	// The upstream binds a WebSocket to the ConversationId / X-SessionId in its
+	// URL. A pre-warmed socket therefore dictates the IDs of the request that
+	// consumes it: the payload and the returned Result must carry the socket's
+	// own IDs, otherwise the follow-up turn (dialed with the IDs we reported)
+	// lands in an empty upstream conversation and the context is lost.
+	// Continuations and memory-disabled requests always dial their own socket.
 	poolEligible := poolEligibleFor(req)
-	if poolEligible {
-		req.SessionID = uuid.NewString()
-		req.ConversationID = uuid.NewString()
-		firstTurn = true
-	} else {
-		if req.SessionID == "" {
-			req.SessionID = uuid.NewString()
-			firstTurn = true
-		}
-		if req.ConversationID == "" {
-			req.ConversationID = uuid.NewString()
-			firstTurn = true
-		}
-	}
 	requestID := uuid.NewString()
-	wsURL, err := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, requestID, req.LicenseType, req.Scenario, req.DisableMemory)
-	if err != nil {
-		return Result{}, err
-	}
+	dialStarted := time.Now()
+	var conn *websocket.Conn
+	var reused bool
 	phase := PhaseInit
 	_ = phase
+	if poolEligible && c.Pool != nil {
+		if pc, ids, ok := c.Pool.Take(acc.OID, acc.TID, req.LicenseType, req.Scenario); ok {
+			conn, reused = pc, true
+			req.SessionID, req.ConversationID, requestID = ids.SessionID, ids.ConversationID, ids.RequestID
+			firstTurn = true
+			go func() {
+				warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				c.Pool.Warm(warmCtx, acc, req.LicenseType, req.Scenario)
+			}()
+		}
+	}
+	if req.SessionID == "" {
+		req.SessionID = uuid.NewString()
+		firstTurn = true
+	}
+	if req.ConversationID == "" {
+		req.ConversationID = uuid.NewString()
+		firstTurn = true
+	}
+	wsURL, err := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, requestID, req.LicenseType, req.Scenario, req.DisableMemory)
+	if err != nil {
+		if conn != nil {
+			conn.Close()
+		}
+		return Result{}, err
+	}
 	attachCh := make(chan error, 1)
 	if len(req.Attachments) > 0 {
 		go func() { attachCh <- c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments) }()
 	}
-
-	dialStarted := time.Now()
-	var conn *websocket.Conn
-	var reused bool
 	phase = PhaseDial
 
-	if c.Pool != nil {
-		if !poolEligible {
-			// Continuation requests must dial fresh; skip pool Take entirely.
-		} else {
-			var poolErr error
-			conn, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
-			if poolErr != nil {
-				if errors.Is(poolErr, context.Canceled) {
-					return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: poolErr}
-				}
-				return Result{}, wrapDialError(poolErr, 0, 0)
-			}
-			if reused {
-				go func() {
-					warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer cancel()
-					warmReqID := uuid.NewString()
-					warmSID := uuid.NewString()
-					warmCID := uuid.NewString()
-					warmURL, _ := BuildWSURL(acc, warmSID, warmCID, warmReqID, req.LicenseType, req.Scenario)
-					c.Pool.Warm(warmCtx, acc, warmURL)
-				}()
-			}
-		}
-	}
 	if conn == nil {
 		var resp *http.Response
 		conn, resp, err = c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
@@ -496,26 +481,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return conn.WriteMessage(msgType, data)
 	}
 
-	returnConn := false
-	var readerDone <-chan struct{}
-	defer func() {
-		if returnConn && conn != nil && c.Pool != nil && poolEligible {
-			if readerDone != nil {
-				_ = conn.SetReadDeadline(time.Now())
-				<-readerDone
-			}
-			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			c.Pool.Return(acc.OID, acc.TID, conn)
-		} else if conn != nil {
-			conn.Close()
-		}
-	}()
+	// A socket serves exactly one request and is always closed afterwards. It
+	// is never handed to another request: late frames and the upstream
+	// conversation bound to it would otherwise leak into someone else's answer.
+	defer conn.Close()
 
 	phase = PhaseUpload
 	if len(req.Attachments) > 0 {
 		if attachErr := <-attachCh; attachErr != nil {
-			returnConn = false
 			return Result{}, fmt.Errorf("upload attachment: %w", attachErr)
 		}
 	}
@@ -525,14 +498,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 	if !reused {
 		if err := wsWrite(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
-			returnConn = false
 			if errors.Is(err, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
 			}
 			return Result{}, &DialError{Status: 0, Kind: "WS_HANDSHAKE", cause: fmt.Errorf("handshake send: %w", err)}
 		}
 		if _, _, err := conn.ReadMessage(); err != nil {
-			returnConn = false
 			if errors.Is(err, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
 			}
@@ -559,7 +530,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	payloadSentAt := time.Now()
 	ts := Timestamps{RequestSent: payloadSentAt.UTC().Format(time.RFC3339Nano)}
 	if err := wsWrite(websocket.TextMessage, []byte(payload)); err != nil {
-		returnConn = false
 		if errors.Is(err, context.Canceled) {
 			return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
 		}
@@ -707,7 +677,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	readCh := make(chan wsRead, 8)
 	done := make(chan struct{})
 	readStopped := make(chan struct{})
-	readerDone = readStopped
 	defer close(done)
 	go func() {
 		defer close(readStopped)
@@ -731,11 +700,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		var read wsRead
 		select {
 		case <-firstTokenTimeout:
-			returnConn = false
 			_ = conn.Close()
 			return Result{}, ErrFirstTokenTimeout
 		case <-ctx.Done():
-			returnConn = false
 			_ = conn.Close()
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
@@ -744,19 +711,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		case r, ok := <-readCh:
 			if !ok {
 				if ctx.Err() != nil {
-					returnConn = false
 					if errors.Is(ctx.Err(), context.Canceled) {
 						return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
 					}
 					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
 				}
-				returnConn = false
 				return Result{}, fmt.Errorf("ws read before completion: %w", io.ErrUnexpectedEOF)
 			}
 			read = r
 		}
 		if read.err != nil {
-			returnConn = false
 			if errors.Is(read.err, context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: fmt.Errorf("ws read before completion: %w", read.err)}
 			}
@@ -810,7 +774,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						beforeTools := len(seenStreamTools)
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
 							if err := onEvent(ev); err != nil {
-								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -826,7 +789,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						ev.Raw = eventRaw(arg)
 						if ev.Kind != "text" && onEvent != nil {
 							if err := onEvent(ev); err != nil {
-								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -861,7 +823,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame && len(msgs) == 0 {
 						if delta, ok := snapshots.ApplyDelta(w); ok {
 							if err := emitDelta(delta); err != nil {
-								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -955,7 +916,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
 								if err := emitSnapshotForMsg(msgID, text); err != nil {
-									returnConn = false
 									return Result{}, err
 								}
 							}
@@ -990,15 +950,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
 						if imageLimitDetected(rawResult) {
-							returnConn = false
 							return Result{}, ErrImageLimit
 						}
 						if rateLimited(rawResult) {
-							returnConn = false
 							return Result{}, ErrRateLimitNotice
 						}
 						if contentPolicyDetected(rawResult) {
-							returnConn = false
 							return Result{}, ErrOffensiveContent
 						}
 						if mi, ok := res["meteringInformation"]; ok && mi != nil {
@@ -1007,15 +964,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						if msg, ok := res["message"].(string); ok {
 							final = msg
 							if imageLimitDetected(final) {
-								returnConn = false
 								return Result{}, ErrImageLimit
 							}
 							if rateLimited(final) {
-								returnConn = false
 								return Result{}, ErrRateLimitNotice
 							}
 							if IsContentPolicyBlock(final) {
-								returnConn = false
 								return Result{}, ErrOffensiveContent
 							}
 						}
@@ -1027,7 +981,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 			if int(t) == 3 {
 				if errObj, ok := obj["error"].(map[string]any); ok {
-					returnConn = false
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
 				phase = PhaseCompleted
@@ -1038,42 +991,29 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				// handler already rejects notice finals, so this only fires
 				// on frame-order anomalies.
 				if rateLimited(final) {
-					returnConn = false
 					return Result{}, ErrRateLimitNotice
 				}
 				text, ferr := finalizeText(streamed.String(), final, skippedSnapshots, emitDelta)
 				if ferr != nil {
-					returnConn = false
 					return Result{}, ferr
 				}
 				if text == "" {
 					text = strings.Join(deltas, "")
 				}
 				if imageLimitDetected(text) {
-					returnConn = false
 					return Result{}, ErrImageLimit
 				}
 				if rateLimited(text) {
-					returnConn = false
 					return Result{}, ErrRateLimitNotice
 				}
 				if text == "" {
-					returnConn = false
 					return Result{}, ErrEmptyCompletion
 				}
 				if offense != "" {
-					returnConn = false
 					return Result{}, ErrOffensiveContent
 				}
 				if IsContentPolicyBlock(text) {
-					returnConn = false
 					return Result{}, ErrOffensiveContent
-				}
-				// Healthy completion: hand the fresh-request connection back to
-				// the pool instead of closing it. The deferred closer respects
-				// poolEligible so continuation dials are never pooled.
-				if poolEligible {
-					returnConn = true
 				}
 				result := Result{
 					Text:                      text,
@@ -1096,15 +1036,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					Images:                    imageURLs(events),
 					Timestamps:                ts,
 				}
-				if c.Pool != nil {
+				if c.Pool != nil && poolEligible {
 					go func() {
 						warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 						defer cancel()
-						warmReqID := uuid.NewString()
-						warmSID := uuid.NewString()
-						warmCID := uuid.NewString()
-						warmURL, _ := BuildWSURL(acc, warmSID, warmCID, warmReqID, req.LicenseType, req.Scenario)
-						c.Pool.Warm(warmCtx, acc, warmURL)
+						c.Pool.Warm(warmCtx, acc, req.LicenseType, req.Scenario)
 					}()
 				}
 				return result, nil
@@ -1286,7 +1222,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 		// and mirrors the PyRIT request flow.
 		req.Header.Set("X-Variants", "feature.EnableImageSupportInUploadFile")
 		req.Header.Set("X-Scenario", "OfficeWebIncludedCopilot")
-		req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+		req.Header.Set("Referer", "https://copilot.cloud.microsoft/")
 		for k, vv := range c.HTTPHeader {
 			for _, v := range vv {
 				if k != "Origin" || v != "" {

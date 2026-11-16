@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -14,7 +15,22 @@ type pooledConn struct {
 	conn      *websocket.Conn
 	created   time.Time
 	handshook bool
+	ids       PooledIDs
+	variant   string
 }
+
+// PooledIDs are the identifiers a pre-warmed socket was dialed with. The
+// upstream binds a WebSocket to the ConversationId / X-SessionId carried in its
+// URL, so the request that consumes the socket must send exactly these IDs in
+// its payload (and report them back to the caller). Using different IDs makes
+// the next turn of the conversation land in an empty upstream conversation.
+type PooledIDs struct {
+	SessionID      string
+	ConversationID string
+	RequestID      string
+}
+
+func poolVariant(licenseType, scenario string) string { return licenseType + "|" + scenario }
 
 const maxPoolPerKey = 2
 
@@ -43,36 +59,43 @@ func NewConnPool(dialer *websocket.Dialer, header http.Header) *ConnPool {
 
 func (p *ConnPool) key(oid, tid string) string { return oid + "|" + tid }
 
-func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*websocket.Conn, bool, error) {
-	_ = wsURL
-	p.mu.Lock()
+// Take hands out a pre-warmed socket that has never carried a request, or
+// reports false when none matches. A socket is only ever used for one request:
+// it is never put back, so frames or upstream conversation state from one
+// caller can never reach another. The socket must also have been dialed with
+// the same licenseType/scenario as the request that wants it.
+func (p *ConnPool) Take(oid, tid, licenseType, scenario string) (*websocket.Conn, PooledIDs, bool) {
+	if p == nil {
+		return nil, PooledIDs{}, false
+	}
+	want := poolVariant(licenseType, scenario)
 	key := p.key(oid, tid)
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	conns := p.conns[key]
 	for i := len(conns) - 1; i >= 0; i-- {
 		pc := conns[i]
-		if time.Since(pc.created) < 2*time.Minute && pc.handshook {
-			p.conns[key] = append(conns[:i], conns[i+1:]...)
-			p.mu.Unlock()
-			return pc.conn, true, nil
+		if time.Since(pc.created) >= 2*time.Minute || !pc.handshook {
+			pc.conn.Close()
+			conns = append(conns[:i], conns[i+1:]...)
+			continue
 		}
-		pc.conn.Close()
+		if pc.variant != want {
+			continue
+		}
 		conns = append(conns[:i], conns[i+1:]...)
 		p.conns[key] = conns
+		return pc.conn, pc.ids, true
 	}
-	p.mu.Unlock()
-
-	conn, resp, err := p.dialer.DialContext(ctx, wsURL, p.header.Clone())
-	if err != nil {
-		if resp != nil {
-			log.Printf("[connpool] dial failed oid=%s status=%d", oid, resp.StatusCode)
-		}
-		return nil, false, err
-	}
-	return conn, false, nil
+	p.conns[key] = conns
+	return nil, PooledIDs{}, false
 }
 
-func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) bool {
-	if wsURL == "" {
+// Warm dials and handshakes one spare socket for the account. Each socket gets
+// its own fresh session/conversation/request IDs, remembered alongside it so
+// the consuming request can adopt them.
+func (p *ConnPool) Warm(ctx context.Context, acc Account, licenseType, scenario string) bool {
+	if p == nil || acc.OID == "" || acc.TID == "" || acc.AccessToken == "" {
 		return false
 	}
 	key := p.key(acc.OID, acc.TID)
@@ -84,6 +107,11 @@ func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) bool {
 	}
 	p.mu.Unlock()
 
+	ids := PooledIDs{SessionID: uuid.NewString(), ConversationID: uuid.NewString(), RequestID: uuid.NewString()}
+	wsURL, err := BuildWSURL(acc, ids.SessionID, ids.ConversationID, ids.RequestID, licenseType, scenario)
+	if err != nil {
+		return false
+	}
 	conn, resp, err := p.dialer.DialContext(ctx, wsURL, p.header.Clone())
 	if err != nil {
 		if resp != nil {
@@ -114,7 +142,7 @@ func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) bool {
 		p.mu.Unlock()
 		return false
 	}
-	p.conns[key] = append(p.conns[key], &pooledConn{conn: conn, created: time.Now(), handshook: true})
+	p.conns[key] = append(p.conns[key], &pooledConn{conn: conn, created: time.Now(), handshook: true, ids: ids, variant: poolVariant(licenseType, scenario)})
 	p.mu.Unlock()
 
 	log.Printf("[connpool] warmed connection oid=%s tid=%s", acc.OID, acc.TID)
@@ -137,28 +165,6 @@ func (p *ConnPool) Idle(oid, tid string) int {
 		}
 	}
 	return n
-}
-
-func (p *ConnPool) Return(oid, tid string, conn *websocket.Conn) {
-	if conn == nil {
-		return
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-	_ = conn.SetWriteDeadline(time.Time{})
-	key := p.key(oid, tid)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.conns[key]) >= maxPoolPerKey {
-		conn.Close()
-		return
-	}
-	p.conns[key] = append(p.conns[key], &pooledConn{conn: conn, created: time.Now(), handshook: true})
-}
-
-func (p *ConnPool) Discard(oid, tid string, conn *websocket.Conn) {
-	if conn != nil {
-		conn.Close()
-	}
 }
 
 func (p *ConnPool) GC() {

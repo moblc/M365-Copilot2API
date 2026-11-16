@@ -238,7 +238,7 @@ func fetchUpstreamTones() []string {
 		}
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	pageURL := "https://m365.cloud.microsoft/"
+	pageURL := "https://copilot.cloud.microsoft/"
 	if resp, err := client.Get(pageURL); err == nil {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		resp.Body.Close()

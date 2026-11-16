@@ -13,7 +13,7 @@ import (
 // chromeUA 与 chathub 包 WS 侧保持一致，避免 WS 与 REST 指纹混搭（HAR 报告 08 §3）。
 const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-const healthPingEndpoint = "https://m365.cloud.microsoft/client_health_ping"
+const healthPingEndpoint = "https://copilot.cloud.microsoft/client_health_ping"
 
 const healthPingTTL = 6 * time.Hour
 

@@ -148,6 +148,13 @@ var openSettingsStore = sync.OnceValue(func() *settingsStore {
 	if s.v.ToolPlanningMode == "" || (s.v.ToolPlanningMode == "native" && !strings.EqualFold(strings.TrimSpace(os.Getenv("M365_TOOL_PLANNING_MODE")), "native")) {
 		s.v.ToolPlanningMode = "router"
 	}
+	// Microsoft disabled the CopilotConsumer scenario with the move to
+	// copilot.cloud.microsoft: the upstream answers 403 with an empty body.
+	// Migrate persisted settings (and M365_SCENARIO) to the browser's scenario.
+	if strings.EqualFold(strings.TrimSpace(s.v.Scenario), "CopilotConsumer") {
+		log.Printf("[settings] scenario CopilotConsumer is disabled upstream; using OfficeWebIncludedCopilot")
+		s.v.Scenario = "OfficeWebIncludedCopilot"
+	}
 	if e := validateSettings(s.v); e != nil {
 		log.Printf("[settings] invalid persisted settings: %v", e)
 	}
@@ -230,9 +237,9 @@ func validateSettings(v runtimeSettings) error {
 	if !validLicenses[v.LicenseType] {
 		return fmt.Errorf("licenseType 必须为 Starter、Premium、Free、BCAIS、BCSWW、BCWAF 或 BCWBF")
 	}
-	validScenarios := map[string]bool{"OfficeWebIncludedCopilot": true, "OfficeWebPaidCopilot": true, "Bizchat": true, "CopilotConsumer": true, "Chathub": true}
+	validScenarios := map[string]bool{"OfficeWebIncludedCopilot": true, "OfficeWebPaidCopilot": true, "Bizchat": true, "Chathub": true}
 	if !validScenarios[v.Scenario] {
-		return fmt.Errorf("scenario 必须为 OfficeWebIncludedCopilot、OfficeWebPaidCopilot、Bizchat、CopilotConsumer 或 Chathub")
+		return fmt.Errorf("scenario 必须为 OfficeWebIncludedCopilot、OfficeWebPaidCopilot、Bizchat 或 Chathub（CopilotConsumer 已被微软禁用）")
 	}
 	if v.AccountConcurrencyLimit < 1 || v.AccountConcurrencyLimit > 64 {
 		return fmt.Errorf("账号并发上限必须为 1-64")

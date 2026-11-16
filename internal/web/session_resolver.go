@@ -323,7 +323,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	// 浜戠瀵硅瘽锛屼絾鍙湪鍚屼竴 IP/UA 鎸囩汗涓嬶紝閬垮厤鐭秷鎭湪涓嶅悓鐢ㄦ埛闂翠簰绔?
 	// HistoryLen 杩斿洖璇ュ墠缂€闀垮害锛屼笂灞傛嵁姝ゅ彧鍙戦€?messages[HistoryLen:] 澧為噺銆?
 	ipFinger := clientIPFingerprint(r)
-	if bestID, n := sr.matchContextLocked(tenant, ipFinger, body.Messages); bestID != "" {
+	if bestID, n := sr.matchContextLocked(tenant, ipFinger, body.User, body.Messages); bestID != "" {
 		sess := sr.sessions[bestID]
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestID] = sess
@@ -395,7 +395,11 @@ func suffixMatchLen(hist, msgs []oaiMsg) int {
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
 // 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
 // (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
-func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages []oaiMsg) (string, int) {
+//
+// user is the request's `user` field. A binding is only reusable by a request
+// carrying the same value, so end users multiplexed behind one API key and one
+// relay IP are kept apart whenever the relay identifies them.
+func (sr *sessionResolver) matchContextLocked(tenant, ipFinger, user string, messages []oaiMsg) (string, int) {
 	if len(messages) == 0 {
 		return "", 0
 	}
@@ -413,6 +417,9 @@ func (sr *sessionResolver) matchContextLocked(tenant, ipFinger string, messages 
 			continue
 		}
 		if sess.IPFingerprint != ipFinger {
+			continue
+		}
+		if sess.UserField != user {
 			continue
 		}
 		n := contextPrefixLen(sess.ContextHistory, messages)

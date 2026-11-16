@@ -15,16 +15,17 @@ func TestResolveContentKeyedSameIdentity(t *testing.T) {
 	t.Setenv("M365_USER_SESSION_CACHE", filepath.Join(t.TempDir(), "users.json"))
 	sr := openSessionResolver()
 
-	// 首次请求绑定云端对话，同一 IP/UA 但不同 user 账户。
+	// 首次请求绑定云端对话。
 	sr.Bind("", "conv-shared", "acc1",
 		&oaiReq{User: "alice", Messages: []oaiMsg{{Role: "user", Content: "hello"}, {Role: "assistant", Content: "你好"}}},
 		"",
 		resolverTestRequest("203.0.113.10", "client-a", "alice"))
 
-	// 续接请求来自同一 IP/UA（换 user 仍可命中，说明不做 user 拦截）。
-	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "bob"),
+	// 续接请求来自同一 IP/UA、同一 user：按内容前缀命中并增量发送。
+	// 不同 user 不得命中，见 TestContentKeyDoesNotCrossUserField。
+	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
 		&oaiReq{
-			User: "bob",
+			User: "alice",
 			Messages: []oaiMsg{
 				{Role: "user", Content: "hello"},
 				{Role: "assistant", Content: "你好"},

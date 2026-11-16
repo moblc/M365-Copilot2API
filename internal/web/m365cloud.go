@@ -123,7 +123,7 @@ func (c *M365CloudClient) doAPI(action string, payload map[string]any) (map[stri
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", "https://m365.cloud.microsoft/chat", io.NopCloser(stringReader(string(jsonBody))))
+	req, err := http.NewRequest("POST", "https://copilot.cloud.microsoft/chat", io.NopCloser(stringReader(string(jsonBody))))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -132,8 +132,8 @@ func (c *M365CloudClient) doAPI(action string, payload map[string]any) (map[stri
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("User-Agent", chromeUA)
-	req.Header.Set("Origin", "https://m365.cloud.microsoft")
-	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	req.Header.Set("Origin", "https://copilot.cloud.microsoft")
+	req.Header.Set("Referer", "https://copilot.cloud.microsoft/")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
 	resp, err := c.httpClient.Do(req)
@@ -329,7 +329,7 @@ func (c *M365CloudClient) DiscoverTones() []string {
 		}
 	}
 	if token, err := c.getAccessToken(); err == nil && token != "" {
-		req, err := http.NewRequest("GET", "https://m365.cloud.microsoft/chat", nil)
+		req, err := http.NewRequest("GET", "https://copilot.cloud.microsoft/chat", nil)
 		if err == nil {
 			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Set("User-Agent", chromeUA)

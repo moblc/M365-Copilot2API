@@ -206,7 +206,7 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 		Pool:       chathub.NewConnPool(clients.WebSocket, make(http.Header)),
 		Trace:      s.chat.Trace,
 	}
-	c.HTTPHeader.Set("Origin", "https://m365.cloud.microsoft")
+	c.HTTPHeader.Set("Origin", "https://copilot.cloud.microsoft")
 	c.HTTPHeader.Set("User-Agent", chromeUA)
 	actual, _ := s.proxyClients.LoadOrStore(proxyURL, c)
 	return actual.(*chathub.Client)
@@ -319,14 +319,7 @@ func (s *Server) PreheatPool() {
 			go func(a auth.AccountToken, cl *chathub.Client) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
-				reqID := uuid.NewString()
-				sid := uuid.NewString()
-				cid := uuid.NewString()
-				wsURL, err := chathub.BuildWSURL(chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, sid, cid, reqID, cfg.LicenseType, cfg.Scenario)
-				if err != nil {
-					return
-				}
-				cl.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
+				cl.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, cfg.LicenseType, cfg.Scenario)
 			}(acc, client)
 		}
 	}
@@ -420,11 +413,7 @@ func (s *Server) keepPoolWarm() {
 			go func(a auth.AccountToken, cl *chathub.Client) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
-				wsURL, err := chathub.BuildWSURL(chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, uuid.NewString(), uuid.NewString(), uuid.NewString(), cfg.LicenseType, cfg.Scenario)
-				if err != nil {
-					return
-				}
-				ok := cl.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, wsURL)
+				ok := cl.Pool.Warm(ctx, chathub.Account{AccessToken: a.AccessToken, OID: a.OID, TID: a.TID}, cfg.LicenseType, cfg.Scenario)
 				s.noteWarmResult(a.ID, ok)
 			}(acc, s.accountClient(acc.ID))
 		}
@@ -2487,21 +2476,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if body.SessionKey != "" {
-		if v, ok := s.sessions.get(body.SessionKey); ok {
+	// session_key is namespaced per API key so two callers that pick the same
+	// key can never resume each other's upstream conversation.
+	sessionKey := scopedSessionKey(r, body.SessionKey)
+	if sessionKey != "" {
+		if v, ok := s.sessions.get(sessionKey); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
-	if body.User != "" && body.ConversationID == "" {
-		if us, ok := s.userSessions.Get(tenantFromRequest(r), body.User); ok {
-			body.AccountID = firstNonEmpty(body.AccountID, us.AccountID)
-			body.ConversationID = us.ConversationID
-			body.SessionID = us.SessionID
-			log.Printf("[user-session] hit user=%s conversation=%s session=%s", body.User, us.ConversationID, us.SessionID)
-		}
-	}
+	// The OpenAI `user` field is NOT a conversation key: clients and relays
+	// commonly send one constant value for every chat (or every end user), so
+	// resuming "the user's last conversation" poured unrelated chats into a
+	// single upstream conversation. Continuation is decided only by the
+	// content-keyed session resolver below; `user` merely narrows its matches.
 	tempSession := body.Metadata != nil && body.Metadata.CopilotTempSession
 	if tempSession {
 		body.ConversationID = ""
@@ -2994,8 +2983,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-			if body.SessionKey != "" {
-				s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+			if sessionKey != "" {
+				s.sessions.upsert(conversation{ID: sessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 			}
 			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
@@ -3032,8 +3021,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-		if body.SessionKey != "" {
-			s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+		if sessionKey != "" {
+			s.sessions.upsert(conversation{ID: sessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 		}
 		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
@@ -3363,8 +3352,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+	if sessionKey != "" {
+		s.sessions.upsert(conversation{ID: sessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
 	if !tempSession && body.User != "" && res.ConversationID != "" {
 		s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
@@ -3664,6 +3653,19 @@ func streamFinalResultFallback(streamedContentLen int, final string) string {
 }
 
 const sessionHeaderName = "X-M365-Session-Id"
+
+// scopedSessionKey namespaces a client-chosen session_key by the caller's API
+// key. Requests without an API key (the admin console) keep the raw key.
+func scopedSessionKey(r *http.Request, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	if tenant := tenantFromRequest(r); tenant != "" {
+		return "k:" + tenant + ":" + key
+	}
+	return key
+}
 
 // bindConversation 在请求完成后登记会话解析器索引与缓存统计，流式与非流式
 // 路径共用。会话为内容键，云端的对话由 auto_cleanup 按 2h 闲置窗口回收，
